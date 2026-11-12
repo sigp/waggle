@@ -18,10 +18,13 @@ async-channel = "2.5.0"
 asynchronous-codec = "0.7"
 bytes = "1"
 futures = "0.3"
-libp2p = "0.56.0"
-lru = "0.18.2"
+libp2p = { git = "https://github.com/sigp/rust-libp2p", rev = "a5abdd2038d68362bdd3c0226ae177fe64a3a3d0"}
 prost = "0.14"
-prost-codec = { git = "https://github.com/libp2p/rust-libp2p" }
-rand = "0.10"
+prost-codec = { git = "https://github.com/sigp/rust-libp2p", rev = "a5abdd2038d68362bdd3c0226ae177fe64a3a3d0" }
 thiserror = "2.0.20"
 tracing = "0.1"
+
+[dev-dependencies]
+libp2p = { git = "https://github.com/sigp/rust-libp2p", rev = "a5abdd2038d68362bdd3c0226ae177fe64a3a3d0", features = ["ed25519", "plaintext", "tokio", "yamux"] }
+rand = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

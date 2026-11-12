@@ -17,51 +17,158 @@
 // OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
-use async_channel::{Receiver, Sender, TrySendError, bounded};
+use async_channel::{Receiver, Sender, TrySendError};
 use asynchronous_codec::Framed;
-use futures::{AsyncWriteExt, Sink, Stream, StreamExt};
-use libp2p::Stream as Libp2pStream;
+use futures::{AsyncWriteExt, Sink, Stream, StreamExt, future::BoxFuture};
+use libp2p::{PeerId, Stream as Libp2pStream, swarm::ConnectionId};
 
-use crate::handler::{Event, Received};
-use crate::protocol::{PieceCodec, proto};
+use crate::{
+    handler::{Delivery, ObjectPieces, TopicEvent},
+    protocol::PieceCodec,
+};
 
 /// A per-topic outbound subscription stream.
 ///
-/// Receives the pieces of one topic from our subscription stream and
-/// surfaces them as `Received` events. Ends when the local node unsubscribes
-/// (the close-signal channel closes) or the peer closes the stream.
-#[derive(Debug)]
+/// Forwards the pieces of one topic read from our subscription stream to the
+/// topic's channel, between a [`TopicEvent::Opened`] and a
+/// [`TopicEvent::Closed`]. Stops reading while a message waits for room in
+/// the channel. Completes once the stream ended and the `Closed` was
+/// delivered, or once the channel closed and the stream with it: the
+/// application dropped the receiver, unsubscribing from the topic.
 pub struct Outbound {
     topic: Vec<u8>,
-    /// Clone of the topic's close signal. The stream ends when its channel
-    /// closes.
-    close_signal: Pin<Box<Receiver<()>>>,
+    /// The remote peer of the stream.
+    peer_id: PeerId,
+    /// The connection the stream is on.
+    connection_id: ConnectionId,
+    /// The sending half of the topic's channel.
+    sender: Sender<TopicEvent>,
+    /// Resolves when the channel closes.
+    unsubscribed: BoxFuture<'static, ()>,
+    /// The message waiting for room in the channel. Resolves to `false` when
+    /// the channel closes.
+    delivery: Option<BoxFuture<'static, bool>>,
     state: OutboundState,
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outbound")
+            .field("topic", &self.topic)
+            .field("peer_id", &self.peer_id)
+            .field("connection_id", &self.connection_id)
+            .field("sender", &self.sender)
+            .field("delivering", &self.delivery.is_some())
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Outbound {
     /// Creates a new `Outbound` stream for a topic.
     ///
-    /// `framed` is the negotiated subscription stream. `close_signal` is a
-    /// clone of the topic's close signal; it wakes and ends the stream when
-    /// the channel closes on unsubscribe.
+    /// `framed` is the negotiated subscription stream to `peer_id` on
+    /// `connection_id`. `sender` is a clone of the sending half of the
+    /// topic's channel; the stream closes when the channel closes.
     pub(crate) fn new(
         topic: Vec<u8>,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
         framed: Framed<Libp2pStream, PieceCodec>,
-        close_signal: Receiver<()>,
+        sender: Sender<TopicEvent>,
     ) -> Self {
-        Self {
+        // `Sender::closed` borrows the sender, so the future owns a clone.
+        let watched = sender.clone();
+        let mut outbound = Self {
             topic,
-            close_signal: Box::pin(close_signal),
+            peer_id,
+            connection_id,
+            sender,
+            unsubscribed: Box::pin(async move { watched.closed().await }),
+            delivery: None,
             state: OutboundState::Active(framed),
+        };
+        outbound.deliver(TopicEvent::Opened {
+            peer_id,
+            connection_id,
+        });
+        outbound
+    }
+
+    /// Delivers `event` on the topic's channel, or keeps it until the channel
+    /// has room.
+    fn deliver(&mut self, event: TopicEvent) {
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            // Stop reading until the application makes room.
+            Err(TrySendError::Full(event)) => {
+                let sender = self.sender.clone();
+                self.delivery = Some(Box::pin(async move { sender.send(event).await.is_ok() }));
+            }
+            Err(TrySendError::Closed(_)) => self.unsubscribe(),
         }
+    }
+
+    /// The channel closed: the application unsubscribed. Drops the message
+    /// waiting for room and closes the stream quietly.
+    fn unsubscribe(&mut self) {
+        tracing::debug!(topic = ?self.topic, "Receive channel closed");
+        self.delivery = None;
+        self.close_stream();
+    }
+
+    /// The stream ended: closes it and tells the application.
+    fn end(&mut self) {
+        self.close_stream();
+        self.deliver(TopicEvent::Closed {
+            peer_id: self.peer_id,
+            connection_id: self.connection_id,
+        });
+    }
+
+    /// Starts closing the stream, unless it is closing already.
+    fn close_stream(&mut self) {
+        self.state = match std::mem::replace(&mut self.state, OutboundState::Closed) {
+            OutboundState::Active(framed) => OutboundState::closing(framed),
+            state => state,
+        };
+    }
+
+    /// Ends the stream with its connection.
+    ///
+    /// Returns the delivery of the events the application is still owed: the
+    /// message waiting for room, and the `Closed` if the stream had not ended
+    /// yet.
+    pub(crate) fn into_delivery(self) -> Option<Delivery> {
+        if self.sender.is_closed() {
+            return None;
+        }
+        let closed = matches!(self.state, OutboundState::Active(_)).then_some(TopicEvent::Closed {
+            peer_id: self.peer_id,
+            connection_id: self.connection_id,
+        });
+        let Self {
+            sender, delivery, ..
+        } = self;
+        if delivery.is_none() && closed.is_none() {
+            return None;
+        }
+        Some(Delivery(Box::pin(async move {
+            if let Some(delivery) = delivery
+                && !delivery.await
+            {
+                return;
+            }
+            if let Some(closed) = closed {
+                let _ = sender.send(closed).await;
+            }
+        })))
     }
 }
 
@@ -70,13 +177,17 @@ pub enum OutboundState {
     /// The stream is open and receiving pieces.
     Active(Framed<Libp2pStream, PieceCodec>),
     /// The stream is being closed.
-    Closing(Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>),
+    Closing(BoxFuture<'static, Result<(), std::io::Error>>),
     /// The stream is closed.
     Closed,
-    /// Temporary state used during state transitions. It allows moving values
-    /// out of the enum. The application never observes this variant during
-    /// normal operation.
-    Poisoned,
+}
+
+impl OutboundState {
+    /// Starts closing the stream behind `framed`.
+    fn closing(framed: Framed<Libp2pStream, PieceCodec>) -> Self {
+        let mut stream = framed.into_inner();
+        Self::Closing(Box::pin(async move { stream.close().await }))
+    }
 }
 
 impl std::fmt::Debug for OutboundState {
@@ -85,197 +196,89 @@ impl std::fmt::Debug for OutboundState {
             Self::Active(arg0) => f.debug_tuple("Active").field(arg0).finish(),
             Self::Closing(_) => f.debug_tuple("Closing").finish(),
             Self::Closed => f.debug_tuple("Closed").finish(),
-            Self::Poisoned => write!(f, "Poisoned"),
         }
     }
 }
 
-impl Stream for Outbound {
-    type Item = Event;
+impl Future for Outbound {
+    type Output = ();
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         loop {
-            let state = std::mem::replace(&mut this.state, OutboundState::Poisoned);
-            match state {
-                OutboundState::Active(mut framed) => {
-                    // Local unsubscribe signal: close the stream quietly.
-                    if this.close_signal.as_mut().poll_next(cx).is_ready() {
-                        let mut stream = framed.into_inner();
-                        this.state =
-                            OutboundState::Closing(Box::pin(async move { stream.close().await }));
+            // Deliver the message waiting for room first: nothing is read
+            // until it is delivered.
+            if let Some(delivery) = &mut this.delivery {
+                match delivery.as_mut().poll(cx) {
+                    Poll::Ready(true) => this.delivery = None,
+                    Poll::Ready(false) => this.unsubscribe(),
+                    Poll::Pending => {}
+                }
+            }
+
+            match &mut this.state {
+                OutboundState::Active(framed) => {
+                    if this.delivery.is_some() {
+                        return Poll::Pending;
+                    }
+
+                    // The application dropped the receiver: close the stream
+                    // without waiting for the next piece.
+                    if this.unsubscribed.as_mut().poll(cx).is_ready() {
+                        this.unsubscribe();
                         continue;
                     }
 
                     match framed.poll_next_unpin(cx) {
-                        Poll::Ready(Some(result)) => match result {
-                            Ok(piece) => {
-                                this.state = OutboundState::Active(framed);
-                                return Poll::Ready(Some(Event::Received(Received {
-                                    topic_id: this.topic.clone(),
-                                    object_id: piece.object_id,
-                                    metadata: piece.pieces_metadata,
-                                    pieces: piece.pieces,
-                                })));
-                            }
-                            Err(err) => {
-                                // TODO: Report a protocol violation when data is invalid?
-                                tracing::debug!("Failed to decode piece: {err}");
-                                let mut stream = framed.into_inner();
-                                this.state = OutboundState::Closing(Box::pin(async move {
-                                    stream.close().await
-                                }));
-                            }
-                        },
+                        Poll::Ready(Some(Ok(pieces))) => this.deliver(TopicEvent::Pieces {
+                            peer_id: this.peer_id,
+                            connection_id: this.connection_id,
+                            pieces: pieces.into(),
+                        }),
+                        Poll::Ready(Some(Err(err))) => {
+                            // TODO: Report a protocol violation when data is invalid?
+                            tracing::debug!("Failed to decode piece: {err}");
+                            this.end();
+                        }
                         // The peer closed the stream.
-                        Poll::Ready(None) => {
-                            let mut stream = framed.into_inner();
-                            this.state =
-                                OutboundState::Closing(Box::pin(
-                                    async move { stream.close().await },
-                                ));
-                        }
-                        Poll::Pending => {
-                            this.state = OutboundState::Active(framed);
-                            return Poll::Pending;
-                        }
+                        Poll::Ready(None) => this.end(),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
-                OutboundState::Closing(mut pin) => {
-                    let Poll::Ready(result) = pin.as_mut().poll(cx) else {
-                        this.state = OutboundState::Closing(pin);
+                OutboundState::Closing(closing) => {
+                    let Poll::Ready(result) = closing.as_mut().poll(cx) else {
                         return Poll::Pending;
                     };
                     if let Err(err) = result {
                         tracing::debug!("Error closing outbound stream: {err}");
                     }
                     this.state = OutboundState::Closed;
-                    return Poll::Ready(None);
                 }
-                OutboundState::Closed => {
-                    this.state = OutboundState::Closed;
-                    return Poll::Ready(None);
-                }
-                OutboundState::Poisoned => {
-                    panic!("entered poisoned outbound stream state")
-                }
+                // Done once the `Closed` is delivered.
+                OutboundState::Closed if this.delivery.is_some() => return Poll::Pending,
+                OutboundState::Closed => return Poll::Ready(()),
             }
         }
     }
 }
 
-/// Fan-out close signal for the topic subscription streams.
+/// Queues object pieces for a remote peer subscribed to a topic.
 ///
-/// Holds one producer `Sender`. Each connection receives a clone of the
-/// receiver, so all the topic's streams close together when the signal is
-/// dropped on unsubscribe.
-#[derive(Debug)]
-pub(crate) struct CloseSignal {
-    /// Keeps the channel open. The signal is dropped on unsubscribe; when the
-    /// `Sender` drops, the channel closes and every receiver wakes.
-    #[allow(unused)]
-    sender: Sender<()>,
-    /// Source for the per-connection receiver clones.
-    receiver: Receiver<()>,
-}
-
-impl CloseSignal {
-    /// Creates a new close signal for a topic.
-    ///
-    /// The signal never carries a message. The channel closes only when the
-    /// `sender` is dropped.
-    pub(crate) fn new() -> Self {
-        let (sender, receiver) = bounded(1);
-        Self { sender, receiver }
-    }
-
-    /// Returns a receiver clone for one connection.
-    pub(crate) fn receiver(&self) -> Receiver<()> {
-        self.receiver.clone()
-    }
-}
-/// Errors from the outbound hub when dispatching a message.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SendError {
-    /// The connection's outbound queue reached its limit.
-    #[error("connection outbound queue full")]
-    Full,
-    /// The channel for the topic is closed.
-    #[error("outbound channel closed")]
-    Closed,
-    /// There is no outbound stream for the topic.
-    #[error("no outbound stream for the topic")]
-    UnknownTopic,
-}
-
-/// Per-connection dispatcher for outbound piece messages.
-///
-/// Routes the published pieces to the topic's stream writers under one
-/// connection-wide queue budget.
-#[derive(Debug)]
-pub(crate) struct DispatchHub {
-    /// The connection's outbound queue limit.
-    limit: usize,
-    /// The number of messages currently queued on the connection, shared with
-    /// the outbound receivers.
-    used: Arc<AtomicUsize>,
-    /// The per-topic senders, keyed by topic.
-    pub(crate) senders: HashMap<Vec<u8>, Sender<proto::ObjectPieces>>,
-}
-
-impl DispatchHub {
-    /// Creates an empty hub with the given queue `limit`.
-    pub(crate) fn new(limit: usize, used: Arc<AtomicUsize>) -> Self {
-        Self {
-            limit,
-            used,
-            senders: HashMap::new(),
-        }
-    }
-
-    /// Queues `message` on the outbound channel for `topic`.
-    ///
-    /// Returns `Full` when the connection's queue reached its limit, `Closed`
-    /// when the channel is closed, and `UnknownTopic` when there is no
-    /// channel for the topic.
-    pub(crate) fn try_send(
-        &self,
-        topic: &[u8],
-        message: proto::ObjectPieces,
-    ) -> Result<(), SendError> {
-        let Some(sender) = self.senders.get(topic) else {
-            return Err(SendError::UnknownTopic);
-        };
-        let n = self.used.fetch_add(1, Ordering::SeqCst);
-        if n >= self.limit {
-            self.used.fetch_sub(1, Ordering::SeqCst);
-            return Err(SendError::Full);
-        }
-        match sender.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                self.used.fetch_sub(1, Ordering::SeqCst);
-                Err(SendError::Full)
-            }
-            Err(TrySendError::Closed(_)) => {
-                self.used.fetch_sub(1, Ordering::SeqCst);
-                Err(SendError::Closed)
-            }
-        }
-    }
-}
+/// Handed to the application for every remote subscription. The pieces are
+/// written to the subscription stream the peer opened. Holds up to
+/// [`Config::max_send_queue_limit`](crate::config::Config::max_send_queue_limit)
+/// messages.
+pub type PieceSender = Sender<ObjectPieces>;
 
 /// A per-topic inbound stream writer.
 ///
 /// Reads the messages of one topic from its channel and writes them to the
 /// subscription stream the remote peer opened for that topic. The future
-/// completes when the channel closes or a write fails. It completes with
-/// `Some(Unsubscribed)` when the remote closed the stream, or `None` when
-/// the local side stopped it.
+/// completes with the topic when the remote closes its half of the stream,
+/// every sender of the channel is dropped, or a write fails.
 pub struct Inbound {
     topic: Vec<u8>,
-    receiver: Pin<Box<Receiver<proto::ObjectPieces>>>,
-    used: Arc<AtomicUsize>,
+    receiver: Pin<Box<Receiver<ObjectPieces>>>,
     framed: Pin<Box<Framed<Libp2pStream, PieceCodec>>>,
     state: InboundState,
 }
@@ -284,29 +287,18 @@ impl Inbound {
     /// Creates a new `Inbound` stream writer for a topic.
     ///
     /// `receiver` is the channel with the messages to send on `topic`.
-    /// `used` is this connection's outbound queue counter, shared with the
-    /// senders. `framed` is the subscription stream the remote peer opened.
+    /// `framed` is the subscription stream the remote peer opened.
     pub(crate) fn new(
         topic: Vec<u8>,
-        receiver: Receiver<proto::ObjectPieces>,
-        used: Arc<AtomicUsize>,
+        receiver: Receiver<ObjectPieces>,
         framed: Framed<Libp2pStream, PieceCodec>,
     ) -> Self {
         Self {
             topic,
             receiver: Box::pin(receiver),
-            used,
             framed: Box::pin(framed),
             state: InboundState::WaitingMessage,
         }
-    }
-}
-
-impl Drop for Inbound {
-    fn drop(&mut self) {
-        // Messages left buffered in the channel were counted on push but never
-        // popped; release their budget so the connection's counter stays exact.
-        self.used.fetch_sub(self.receiver.len(), Ordering::SeqCst);
     }
 }
 
@@ -314,7 +306,7 @@ enum InboundState {
     /// Waiting for the next message from the channel.
     WaitingMessage,
     /// A message was received; watching for sink readiness.
-    WaitingReady { message: proto::ObjectPieces },
+    WaitingReady { message: ObjectPieces },
     /// A message was accepted; the sink is flushing it.
     Flushing,
     /// The writer ended.
@@ -324,23 +316,41 @@ enum InboundState {
 }
 
 impl Future for Inbound {
-    type Output = Option<Event>;
+    type Output = Vec<u8>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        // The remote sends nothing after subscribing: its half of the stream
+        // only ends when it unsubscribes or the stream fails.
+        if !matches!(this.state, InboundState::Closed)
+            && let Poll::Ready(read) = this.framed.as_mut().poll_next(cx)
+        {
+            match read {
+                None => tracing::debug!(topic = ?this.topic, "Remote closed inbound stream"),
+                Some(Ok(_)) => {
+                    tracing::debug!(topic = ?this.topic, "Unexpected message on inbound stream")
+                }
+                Some(Err(err)) => {
+                    tracing::debug!(topic = ?this.topic, "Inbound stream error: {err}")
+                }
+            }
+            this.state = InboundState::Closed;
+            return Poll::Ready(this.topic.clone());
+        }
+
         loop {
             let state = std::mem::replace(&mut this.state, InboundState::Poisoned);
             match state {
                 InboundState::WaitingMessage => match this.receiver.as_mut().poll_next(cx) {
                     Poll::Ready(Some(message)) => {
-                        this.used.fetch_sub(1, Ordering::SeqCst);
                         this.state = InboundState::WaitingReady { message };
                     }
                     // The channel is closed and drained: the local side stopped it.
                     Poll::Ready(None) => {
                         tracing::debug!(topic = ?this.topic, "Outbound channel closed");
                         this.state = InboundState::Closed;
-                        return Poll::Ready(None);
+                        return Poll::Ready(this.topic.clone());
                     }
                     Poll::Pending => {
                         this.state = InboundState::WaitingMessage;
@@ -350,7 +360,7 @@ impl Future for Inbound {
                 InboundState::WaitingReady { message } => {
                     match Sink::poll_ready(this.framed.as_mut(), cx) {
                         Poll::Ready(Ok(())) => {
-                            match Sink::start_send(this.framed.as_mut(), message) {
+                            match Sink::start_send(this.framed.as_mut(), message.into()) {
                                 Ok(()) => this.state = InboundState::Flushing,
                                 Err(err) => {
                                     tracing::debug!(
@@ -358,18 +368,14 @@ impl Future for Inbound {
                                         "Failed to send message on inbound stream: {err}"
                                     );
                                     this.state = InboundState::Closed;
-                                    return Poll::Ready(Some(Event::Unsubscribed {
-                                        topic_id: this.topic.clone(),
-                                    }));
+                                    return Poll::Ready(this.topic.clone());
                                 }
                             }
                         }
                         Poll::Ready(Err(err)) => {
                             tracing::debug!(topic = ?this.topic, "Inbound stream error: {err}");
                             this.state = InboundState::Closed;
-                            return Poll::Ready(Some(Event::Unsubscribed {
-                                topic_id: this.topic.clone(),
-                            }));
+                            return Poll::Ready(this.topic.clone());
                         }
                         Poll::Pending => {
                             this.state = InboundState::WaitingReady { message };
@@ -385,16 +391,14 @@ impl Future for Inbound {
                             "Failed to flush inbound stream: {err}"
                         );
                         this.state = InboundState::Closed;
-                        return Poll::Ready(Some(Event::Unsubscribed {
-                            topic_id: this.topic.clone(),
-                        }));
+                        return Poll::Ready(this.topic.clone());
                     }
                     Poll::Pending => {
                         this.state = InboundState::Flushing;
                         return Poll::Pending;
                     }
                 },
-                InboundState::Closed => return Poll::Ready(None),
+                InboundState::Closed => return Poll::Ready(this.topic.clone()),
                 InboundState::Poisoned => {
                     panic!("entered poisoned inbound stream state")
                 }
